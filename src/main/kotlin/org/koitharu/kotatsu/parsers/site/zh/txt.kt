@@ -105,16 +105,19 @@ internal class BiliManga(
      * （选择器先随便写一个，能编译就行，之后你再对着实际 HTML 改）
      */
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val doc = webClient.httpGet(chapter.url).parseHtml()
-        return doc.select(".chapter-img img").mapIndexed { index, img ->
-            val src = img.src().toAbsoluteUrl(domain)
-            MangaPage(
-                id = generateUid(src + "#$index"),
-                url = src,
-                preview = null,
-                source = source,
-            )
-        }
+    val doc = webClient.httpGet(chapter.url).parseHtml()
+
+    // src() 可能为 null，用 mapIndexedNotNull 做一次过滤
+    return doc.select(".chapter-img img").mapIndexedNotNull { index, img ->
+        val raw = img.src()                       // String?
+        val src = raw?.toAbsoluteUrl(domain) ?: return@mapIndexedNotNull null
+
+        MangaPage(
+            id = generateUid(src + "#$index"),
+            url = src,
+            preview = null,
+            source = source,
+        )
     }
 }
 
