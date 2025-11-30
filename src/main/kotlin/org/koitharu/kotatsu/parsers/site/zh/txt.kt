@@ -14,8 +14,8 @@ internal class BiliManga(
     context: MangaLoaderContext,
 ) : PagedMangaParser(
     context,
-    MangaParserSource.BILIMANGA,   // 确保你已经在 MangaParserSource enum 里加了这个值
-    pageSize = 20,                 // 每页 20 本，随便定
+    MangaParserSource.BILIMANGA,   // 记得在 MangaParserSource 枚举里加 BILIMANGA
+    pageSize = 20,
 ) {
 
     // 域名配置
@@ -25,18 +25,18 @@ internal class BiliManga(
     override val availableSortOrders: Set<SortOrder> =
         EnumSet.of(SortOrder.POPULARITY)
 
-    // 你的库版本里构造参数比较少，用最简单的就行
+    // 你的 fork 版本里构造比较简单，就只开搜索开关这一项
     override val filterCapabilities: MangaListFilterCapabilities =
         MangaListFilterCapabilities(
             isSearchSupported = false,
         )
 
-    // 没有额外筛选项，直接空
+    // 暂时没有额外筛选项
     override suspend fun getFilterOptions(): MangaListFilterOptions =
         MangaListFilterOptions()
 
     /**
-     * 这里是真正拉“周点击榜”列表的地方
+     * 列表页：周点击榜
      * /top/weekvisit/{page}.html
      */
     override suspend fun getListPage(
@@ -58,7 +58,7 @@ internal class BiliManga(
             val title = a.selectFirst(".book-title")?.text().orEmpty()
             val coverUrl = a.selectFirst("img")?.src().orEmpty()
 
-            // 作者元素可能在别处，你后面可以再对着改选择器
+            // 作者选择器先随便写一个，后面可以再对着页面改
             val author = a.selectFirst(".book-author")?.text()?.trim().orEmpty()
 
             Manga(
@@ -78,8 +78,7 @@ internal class BiliManga(
         }
 
     /**
-     * 详情页：先做一个最简单版本，只补一点状态和简介，
-     * 以后你要解析章节列表，再在这里加就行
+     * 详情页：先做简单版，只补一点简介和状态
      */
     override suspend fun getDetails(manga: Manga): Manga {
         val doc = webClient.httpGet(manga.url).parseHtml()
@@ -101,23 +100,22 @@ internal class BiliManga(
     }
 
     /**
-     * 章节阅读页：解析图片列表
-     * （选择器先随便写一个，能编译就行，之后你再对着实际 HTML 改）
+     * 阅读页：解析章节里的图片列表
+     * 选择器 .chapter-img img 只是占位，后续可以根据实际 HTML 再改
      */
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-    val doc = webClient.httpGet(chapter.url).parseHtml()
+        val doc = webClient.httpGet(chapter.url).parseHtml()
 
-    // src() 可能为 null，用 mapIndexedNotNull 做一次过滤
-    return doc.select(".chapter-img img").mapIndexedNotNull { index, img ->
-        val raw = img.src()                       // String?
-        val src = raw?.toAbsoluteUrl(domain) ?: return@mapIndexedNotNull null
+        return doc.select(".chapter-img img").mapIndexedNotNull { index, img ->
+            val raw = img.src()                 // String?（在你这个版本里可能是可空）
+            val src = raw?.toAbsoluteUrl(domain) ?: return@mapIndexedNotNull null
 
-        MangaPage(
-            id = generateUid(src + "#$index"),
-            url = src,
-            preview = null,
-            source = source,
-        )
+            MangaPage(
+                id = generateUid(src + "#$index"),
+                url = src,
+                preview = null,
+                source = source,
+            )
+        }
     }
 }
-
