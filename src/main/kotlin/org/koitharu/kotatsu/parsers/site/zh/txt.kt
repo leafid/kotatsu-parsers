@@ -164,17 +164,22 @@ internal class BiliManga(
     // 3. 章节阅读页 -> 图片列表
     // https://www.bilimanga.net/read/145/10590.html
     // img.imagecontent，优先取 data-src，其次 src
+    // 关键：给每页图片设置 referer，防止图片服务器拦截
     // ================
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val doc = webClient.httpGet(chapter.url).parseHtml()
 
+        // 用章节页作为 Referer（也可以用 "https://$domain/"，两种都行，一般章节页更安全）
+        val referer = chapter.url
+
         return doc.select("img.imagecontent").mapIndexedNotNull { index, img ->
-            // 1. 先拿真正的图片地址（data-src）
+
+            // 1. 先拿真正的图片地址（data-src），没有就退回 src
             val candidate = img.attr("data-src").takeIf { it.isNotBlank() }
                 ?: img.attr("src")
 
             // 2. 过滤掉占位图 / 空串
-            if (candidate.isNullOrBlank() || candidate.startsWith("/images/sloading")) {
+            if (candidate.isBlank() || candidate.startsWith("/images/sloading")) {
                 return@mapIndexedNotNull null
             }
 
@@ -185,11 +190,13 @@ internal class BiliManga(
                 id = generateUid(url + "#$index"),
                 url = url,
                 preview = null,
+                referer = referer,
                 source = source,
             )
         }
     }
 }
+
 /**
  * 小工具：把简单的 HTML 文本里标签干掉
  *（非常粗暴的版本，够用就行）
