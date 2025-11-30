@@ -8,8 +8,6 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.util.EnumSet
-import okhttp3.Interceptor
-import okhttp3.Response
 
 @MangaSourceParser("BILIMANGA", "BiliManga", "zh")
 internal class BiliManga(
@@ -191,55 +189,7 @@ internal class BiliManga(
             )
         }
     }
-
-    /**
-     * 自定义网络拦截：
-     * - BiliManga 的真正图片在 i.motiezw.com 上
-     * - 直接访问会返回 “Sorry, you have been blocked”
-     * - 这里给它补上 Referer + 手机 UA + Accept image/avif
-     */
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val original = chain.request()
-        val url = original.url
-
-        // 只处理图片域名 i.motiezw.com，其它请求不改
-        return if (url.host == "i.motiezw.com") {
-            val builder = original.newBuilder()
-
-            // 强制 Referer 指向 BiliManga 主站
-            builder.header("Referer", "https://www.bilimanga.net/")
-
-            // UA 伪装成 Android Chrome
-            builder.header("User-Agent", MOBILE_CHROME_UA)
-
-            // 明确声明支持 avif
-            builder.header(
-                "Accept",
-                "image/avif,image/webp,image/*,*/*;q=0.8",
-            )
-
-            // 顺便带上常见的语言头（可有可无，但更像真实浏览器）
-            if (original.header("Accept-Language") == null) {
-                builder.header("Accept-Language", "zh-CN,zh;q=0.9")
-            }
-
-            // 你也可以按需加 cache-control / pragma 之类，这里就不再赘述
-            val newRequest = builder.build()
-            chain.proceed(newRequest)
-        } else {
-            chain.proceed(original)
-        }
-    }
-
-    private companion object {
-        // 模拟一个正常的安卓 Chrome UA（版本号无所谓，只要像就行）
-        private const val MOBILE_CHROME_UA =
-            "Mozilla/5.0 (Linux; Android 10; K) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/116.0.0.0 Mobile Safari/537.36"
-    }
 }
-
 /**
  * 小工具：把简单的 HTML 文本里标签干掉
  *（非常粗暴的版本，够用就行）
