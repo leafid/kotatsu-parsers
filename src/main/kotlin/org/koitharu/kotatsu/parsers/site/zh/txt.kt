@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.zh
 
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -16,7 +18,7 @@ internal class BiliManga(
     context,
     MangaParserSource.BILIMANGA,
     pageSize = 20,
-) {
+), Interceptor { // 👈 关键：实现 OkHttp Interceptor
 
     // 域名
     override val configKeyDomain = ConfigKey.Domain("www.bilimanga.net")
@@ -164,22 +166,17 @@ internal class BiliManga(
     // 3. 章节阅读页 -> 图片列表
     // https://www.bilimanga.net/read/145/10590.html
     // img.imagecontent，优先取 data-src，其次 src
-    // 关键：给每页图片设置 referer，防止图片服务器拦截
     // ================
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val doc = webClient.httpGet(chapter.url).parseHtml()
 
-        // 用章节页作为 Referer（也可以用 "https://$domain/"，两种都行，一般章节页更安全）
-        val referer = chapter.url
-
-        return doc.select("img.imagecontent").mapIndexedNotNull { index, img ->
-
-            // 1. 先拿真正的图片地址（data-src），没有就退回 src
+        return doc.select("div#acontentz img.imagecontent").mapIndexedNotNull { index, img ->
+            // 1. 先拿真正的图片地址（data-src）
             val candidate = img.attr("data-src").takeIf { it.isNotBlank() }
                 ?: img.attr("src")
 
             // 2. 过滤掉占位图 / 空串
-            if (candidate.isBlank() || candidate.startsWith("/images/sloading")) {
+            if (candidate.isNullOrBlank() || candidate.startsWith("/images/sloading")) {
                 return@mapIndexedNotNull null
             }
 
@@ -190,9 +187,34 @@ internal class BiliManga(
                 id = generateUid(url + "#$index"),
                 url = url,
                 preview = null,
-                referer = referer,
                 source = source,
             )
+        }
+    }
+
+    /**
+     * 关键拦截器：
+     *
+     * - 对 bilimanga 本身和图片 CDN 域名的请求，强制加上 Referer/Origin。
+     * - 这样图片服务器会认为请求是从 bilimanga 网页发出的，不会再返回 "Sorry, you have been blocked"。
+     */
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val original = chain.request()
+        val url = original.url
+        val host = url.host.lowercase()
+
+        // bilimanga 主站 + 图片 CDN 域名都统一加头
+        val needsReferer = host.contains("bilimanga.net") ||
+            host == "i.motiezw.com"
+
+        return if (needsReferer) {
+            val newRequest = original.newBuilder()
+                .header("Referer", "https://$domain/") // 模拟从站内跳转
+                .header("Origin", "https://$domain")
+                .build()
+            chain.proceed(newRequest)
+        } else {
+            chain.proceed(original)
         }
     }
 }
