@@ -7,6 +7,7 @@ public data class MangaPage(
 	 * Unique identifier for page
 	 */
 	@JvmField public val id: Long,
+    val referer: String? = null,
 	/**
 	 * Relative url to page (**without** a domain) or any other uri.
 	 * Used principally in parsers.
