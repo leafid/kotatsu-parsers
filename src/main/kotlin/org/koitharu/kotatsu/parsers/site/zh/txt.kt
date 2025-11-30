@@ -169,24 +169,27 @@ internal class BiliManga(
         val doc = webClient.httpGet(chapter.url).parseHtml()
 
         return doc.select("img.imagecontent").mapIndexedNotNull { index, img ->
-            val raw = img.attr("data-src").takeIf { it.isNotBlank() }
+            // 1. 先拿真正的图片地址（data-src）
+            val candidate = img.attr("data-src").takeIf { it.isNotBlank() }
                 ?: img.attr("src")
 
-            if (raw.isNullOrBlank()) {
-                null
-            } else {
-                val url = raw.toAbsoluteUrl(domain)
-                MangaPage(
-                    id = generateUid(url + "#$index"),
-                    url = url,
-                    preview = null,
-                    source = source,
-                )
+            // 2. 过滤掉占位图 / 空串
+            if (candidate.isNullOrBlank() || candidate.startsWith("/images/sloading")) {
+                return@mapIndexedNotNull null
             }
+
+            // 3. 处理相对 / 绝对 URL
+            val url = candidate.toAbsoluteUrl(domain)
+
+            MangaPage(
+                id = generateUid(url + "#$index"),
+                url = url,
+                preview = null,
+                source = source,
+            )
         }
     }
 }
-
 /**
  * 小工具：把简单的 HTML 文本里标签干掉
  *（非常粗暴的版本，够用就行）
