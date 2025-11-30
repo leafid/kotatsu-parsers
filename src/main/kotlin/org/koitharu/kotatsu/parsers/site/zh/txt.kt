@@ -53,13 +53,13 @@ internal class BiliManga(
     /** 解析榜单列表 li.book-li */
     private fun parseRankingList(doc: Document): List<Manga> =
         doc.select("ol#list_content li.book-li a.book-layout").map { a ->
-            val href = a.attrAsRelativeUrl("href")           // 例如 /detail/145.html
+            val href = a.attrAsRelativeUrl("href")           // /detail/145.html
             val mangaUrl = href.toAbsoluteUrl(domain)
 
             val title = a.selectFirst(".book-title")?.text().orEmpty()
             val coverUrl = a.selectFirst("img")?.src().orEmpty()
 
-            // 作者选择器只是占位，后续可以对着页面再改
+            // 作者选择器先随便写一个，后面可以再对着页面改
             val author = a.selectFirst(".book-author")?.text()?.trim().orEmpty()
 
             Manga(
@@ -81,8 +81,8 @@ internal class BiliManga(
     /**
      * 详情页：
      * 1. 解析简介、状态
-     * 2. 从详情页 URL 里提取漫画 id（例如 145）
-     * 3. 请求 /read/{id}/catalog，解析章节 + 卷
+     * 2. 从详情页 URL 中解析漫画 id（例如 /detail/145.html -> 145）
+     * 3. 请求 /read/{id}/catalog 解析章节 + 卷
      */
     override suspend fun getDetails(manga: Manga): Manga {
         val doc = webClient.httpGet(manga.url).parseHtml()
@@ -97,10 +97,9 @@ internal class BiliManga(
             }
         }
 
-        // 从 URL 里提取漫画 ID（优先第一个数字串，例如 /detail/145.html -> 145）
-        val mangaId = Regex("(\\d+)").find(manga.url)?.groupValues?.get(1)
+        // 从 URL 中提取漫画 ID（优先匹配 /detail/145 这种）
+        val mangaId = extractMangaId(manga.url)
 
-        // 拉取章节目录：/read/{id}/catalog
         val chapters = if (mangaId != null) {
             runCatching { loadCatalogChapters(mangaId) }.getOrElse { emptyList() }
         } else {
@@ -114,66 +113,115 @@ internal class BiliManga(
         )
     }
 
+    /** 从详情页 URL 中提取漫画 ID，例如 /detail/145.html -> 145 */
+    private fun extractMangaId(url: String): String? {
+        // 优先匹配 /detail/145 /detail/145.html
+        val detailMatch = Regex("/detail/(\\d+)").find(url)
+        if (detailMatch != null) {
+            return detailMatch.groupValues[1]
+        }
+        // 兜底：抓第一个数字串
+        return Regex("(\\d+)").find(url)?.groupValues?.get(1)
+    }
+
     /**
-     * 解析 /read/{id}/catalog 页面：
-     * - <li class="chapter-li jsChapter"> … <span class="chapter-index">第２擊</span>
-     * - 上方最近的 <div class="vloume-info"><h3>英雄大全</h3> 是卷信息
+     * 解析 /read/{id}/catalog：
+     *
+     * 章节：
+     *   <li class="chapter-li jsChapter">
+     *     <a href="/read/145/10581.html" class="chapter-li-a ">
+     *       <span class="chapter-index ">第２擊</span>
+     *     </a>
+     *   </li>
+     *
+     * 卷：
+     *   <div class="vloume-info">
+     *     <div class="chapter-bar"><h3>英雄大全</h3></div>
+     *     ...
+     *   </div>
+     *
+     * 思路：按文档顺序遍历 div.vloume-info 和 li.chapter-li.jsChapter，
+     * 看到卷就更新 currentVolumeName，看到章节就挂在当前卷下面。
      */
     private suspend fun loadCatalogChapters(mangaId: String): List<MangaChapter> {
         val url = "https://$domain/read/$mangaId/catalog"
         val doc = webClient.httpGet(url).parseHtml()
 
-        val chapterLis = doc.select("li.chapter-li.jsChapter")
-        if (chapterLis.isEmpty()) return emptyList()
+        // 如果整个页面连一个章节 li 都没有，就直接返回空
+        if (doc.select("li.chapter-li.jsChapter").isEmpty()) {
+            return emptyList()
+        }
 
-        // 把每个卷名映射成一个卷号：1, 2, 3...
+        val result = mutableListOf<MangaChapter>()
+
+        // 卷名 -> 卷号（1、2、3...）
         val volumeIndexByName = LinkedHashMap<String, Int>()
         var nextVolumeIndex = 1
+        var currentVolumeName: String? = null
 
-        return chapterLis.mapIndexed { index, li ->
-            val a = li.selectFirstOrThrow("a.chapter-li-a")
-            val href = a.attrAsRelativeUrl("href")           // 例如 /read/145/10581.html
-            val chapterUrl = href.toAbsoluteUrl(domain)
+        // 混合选择卷和章节，保证按照页面顺序处理
+        val elements = doc.select("div.vloume-info, li.chapter-li.jsChapter")
 
-            val title = li.selectFirst(".chapter-index")?.text()?.trim().orEmpty()
+        var chapterIndex = 0
 
-            // 找到最近的上级 <div class="vloume-info"><h3>卷名</h3>…</div>
-            val parents = li.parents()
-            val volumeElement = parents.firstOrNull { it.hasClass("vloume-info") }
-            val volumeName = volumeElement
-                ?.selectFirst("h3")
-                ?.text()
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
+        for (el in elements) {
+            when {
+                // 卷信息块
+                el.hasClass("vloume-info") -> {
+                    val name = el.selectFirst("h3")
+                        ?.text()
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                    currentVolumeName = name
+                }
 
-            val volumeNumber = volumeName?.let { name ->
-                volumeIndexByName.getOrPut(name) { nextVolumeIndex++ }
-            } ?: 0
+                // 章节 li
+                el.hasClass("chapter-li") && el.hasClass("jsChapter") -> {
+                    val a = el.selectFirstOrThrow("a.chapter-li-a")
+                    val href = a.attrAsRelativeUrl("href")           // /read/145/10581.html
+                    val chapterUrl = href.toAbsoluteUrl(domain)
 
-            MangaChapter(
-                id = generateUid(chapterUrl),
-                title = title,                      // 例如：第２擊
-                number = (index + 1).toFloat(),     // 简单按顺序编号
-                volume = volumeNumber,              // 0 表示没有卷 / 未识别
-                url = chapterUrl,
-                scanlator = null,
-                uploadDate = 0,
-                branch = volumeName,                // 把卷名放在 branch 里（比如 “英雄大全”）
-                source = source,
-            )
+                    val title = a.selectFirst(".chapter-index")
+                        ?.text()
+                        ?.trim()
+                        .orEmpty()
+
+                    // 当前卷对应的卷号，没有卷名就用 0
+                    val volumeNumber = currentVolumeName?.let { name ->
+                        volumeIndexByName.getOrPut(name) { nextVolumeIndex++ }
+                    } ?: 0
+
+                    chapterIndex += 1
+
+                    val chapter = MangaChapter(
+                        id = generateUid(chapterUrl),
+                        title = title,                      // 第２擊
+                        number = chapterIndex.toFloat(),    // 1, 2, 3...
+                        volume = volumeNumber,              // 0 表示没卷/未知
+                        url = chapterUrl,
+                        uploadDate = 0,                     // 页面里没时间，就先写 0
+                        branch = null,
+                        scanlator = null,
+                        source = source,
+                    )
+                    result += chapter
+                }
+            }
         }
+
+        return result
     }
 
     /**
      * 阅读页：解析章节里的图片列表
-     * 这里的选择器 .chapter-img img 是占位，之后你可以根据
-     * /read/145/10581.html 的实际结构再改。
+     * 这里的选择器 .chapter-img img 是占位，之后可以根据
+     * /read/145/10581.html 的真实结构再改。
      */
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val doc = webClient.httpGet(chapter.url).parseHtml()
 
         return doc.select(".chapter-img img").mapIndexedNotNull { index, img ->
-            val raw = img.src()                 // String?（当前版本可能可空）
+            val raw = img.src()                 // String?（当前版本里可能是可空）
             val src = raw?.toAbsoluteUrl(domain) ?: return@mapIndexedNotNull null
 
             MangaPage(
