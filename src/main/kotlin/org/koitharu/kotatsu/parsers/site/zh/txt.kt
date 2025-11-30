@@ -11,152 +11,187 @@ import java.util.EnumSet
 
 @MangaSourceParser("BILIMANGA", "BiliManga", "zh")
 internal class BiliManga(
-	context: MangaLoaderContext,
+    context: MangaLoaderContext,
 ) : PagedMangaParser(
-	context,
-	MangaParserSource.BILIMANGA,
-	pageSize = 20,
+    context,
+    MangaParserSource.BILIMANGA,
+    pageSize = 20,
 ) {
 
-	// 域名配置
-	override val configKeyDomain = ConfigKey.Domain("www.bilimanga.net")
+    // 域名
+    override val configKeyDomain = ConfigKey.Domain("www.bilimanga.net")
 
-	// 排序方式：先只支持人气（周点击）
-	override val availableSortOrders: Set<SortOrder> =
-		EnumSet.of(SortOrder.POPULARITY)
+    // 先只做“人气/点击”这一种排序
+    override val availableSortOrders: Set<SortOrder> =
+        EnumSet.of(SortOrder.POPULARITY)
 
-	// 先不支持搜索/标签/状态这些复杂筛选
-	override val filterCapabilities: MangaListFilterCapabilities
-		get() = MangaListFilterCapabilities(
-			isSearchSupported = false,
-		)
+    // 只开启最简单的功能
+    override val filterCapabilities: MangaListFilterCapabilities =
+        MangaListFilterCapabilities(
+            isSearchSupported = false,
+        )
 
-	// 暂时没有额外筛选项
-	override suspend fun getFilterOptions(): MangaListFilterOptions =
-		MangaListFilterOptions()
+    override suspend fun getFilterOptions(): MangaListFilterOptions =
+        MangaListFilterOptions()
 
-	/**
-	 * 榜单页：周点击榜
-	 * /top/weekvisit/{page}.html
-	 */
-	override suspend fun getListPage(
-		page: Int,
-		order: SortOrder,
-		filter: MangaListFilter,
-	): List<Manga> {
-		val url = "https://$domain/top/weekvisit/$page.html"
-		val doc = webClient.httpGet(url).parseHtml()
-		return parseRankingList(doc)
-	}
+    // ===============
+    // 1. 榜单列表页
+    // /top/weekvisit/{page}.html
+    // ===============
+    override suspend fun getListPage(
+        page: Int,
+        order: SortOrder,
+        filter: MangaListFilter,
+    ): List<Manga> {
+        val url = "https://$domain/top/weekvisit/$page.html"
+        val doc = webClient.httpGet(url).parseHtml()
+        return parseRankingList(doc)
+    }
 
-	/** 解析榜单 li.book-li */
-	private fun parseRankingList(doc: Document): List<Manga> =
-		doc.select("ol#list_content li.book-li a.book-layout").map { a ->
-			val href = a.attrAsRelativeUrl("href") // /detail/145.html
-			val mangaUrl = href.toAbsoluteUrl(domain)
+    private fun parseRankingList(doc: Document): List<Manga> {
+        return doc.select("ol#list_content li.book-li a.book-layout").map { a ->
+            val href = a.attrAsRelativeUrl("href")          // /detail/145.html
+            val mangaUrl = href.toAbsoluteUrl(domain)
 
-			val title = a.selectFirst(".book-title")?.text().orEmpty()
-			val coverUrl = a.selectFirst("img")?.src().orEmpty()
-			val author = a.selectFirst(".book-author")?.text()?.trim().orEmpty()
+            val title = a.selectFirst(".book-title")?.text().orEmpty()
+            val coverUrl = a.selectFirst("img")?.src().orEmpty()
+            val author = a.selectFirst(".book-author")?.text()
+                ?.trim()
+                .orEmpty()
 
-			Manga(
-				id = generateUid(mangaUrl),
-				title = title,
-				altTitles = emptySet(),
-				url = mangaUrl,
-				publicUrl = mangaUrl,
-				rating = RATING_UNKNOWN,
-				contentRating = null,
-				coverUrl = coverUrl,
-				tags = emptySet(),
-				state = null,
-				authors = setOfNotNull(author.takeIf { it.isNotEmpty() }),
-				chapters = emptyList(),
-				source = source,
-			)
-		}
+            Manga(
+                id = generateUid(mangaUrl),
+                url = mangaUrl,
+                publicUrl = mangaUrl,
+                coverUrl = coverUrl,
+                title = title,
+                altTitles = emptySet(),
+                rating = RATING_UNKNOWN,
+                tags = emptySet(),
+                authors = setOfNotNull(author.takeIf { it.isNotEmpty() }),
+                state = null,
+                source = source,
+                contentRating = null,
+            )
+        }
+    }
 
-	/**
-	 * 详情页 + 章节目录：
-	 *  - 详情：https://www.bilimanga.net/detail/145.html
-	 *  - 目录：https://www.bilimanga.net/read/145/catalog
-	 */
-	override suspend fun getDetails(manga: Manga): Manga {
-		// 1. 详情页（简介 / 状态）
-		val detailDoc = webClient
-			.httpGet(manga.url.toAbsoluteUrl(domain))
-			.parseHtml()
+    // ================
+    // 2. 详情页
+    // https://www.bilimanga.net/detail/145.html
+    // 解析简介 + 标签 + 状态，并顺便解析章节（通过 /read/{id}/catalog）
+    // ================
+    override suspend fun getDetails(manga: Manga): Manga {
+        val doc = webClient.httpGet(manga.url).parseHtml()
 
-		val description = detailDoc.selectFirst(".book-desc")?.text().orEmpty()
+        // 简介：<content> ... </content>
+        val description = doc.selectFirst("content")
+            ?.html()   // 保留 <br>
+            ?.replace("<br>", "\n")
+            ?.replace("<br/>", "\n")
+            ?.replace("<br />", "\n")
+            ?.stripHtml()
+            .orEmpty()
 
-		val state = detailDoc.selectFirst(".status-tag")?.text()?.let {
-			when {
-				it.contains("連載") || it.contains("连载") -> MangaState.ONGOING
-				it.contains("完結") || it.contains("完结") -> MangaState.FINISHED
-				else -> null
-			}
-		}
+        // 标签：span.tag-small-group em.tag-small a
+        val tagElements = doc.select("span.tag-small-group em.tag-small a")
+        val tags: Set<MangaTag> = tagElements.map { a ->
+            val name = a.text().trim()
+            MangaTag(
+                key = name,      // 直接用文字当 key 即可
+                title = name,
+                source = source,
+            )
+        }.toSet()
 
-		// 2. 从 /detail/145.html 提取 id = 145
-		val id = manga.url.substringAfterLast("/").substringBefore(".")
-		val catalogUrl = "https://$domain/read/$id/catalog"
+        // 连载状态（页面上如果有的话就解析一下）
+        val state = doc.selectFirst(".status-tag")?.text()?.let {
+            when {
+                it.contains("连载") || it.contains("連載") -> MangaState.ONGOING
+                it.contains("完结") || it.contains("完結") -> MangaState.FINISHED
+                else -> null
+            }
+        }
 
-		// 3. 目录页：解析 li.chapter-li.jsChapter -> a.chapter-li-a
-		val catalogDoc = webClient.httpGet(catalogUrl).parseHtml()
+        // 章节：转到 /read/{id}/catalog
+        val chapters = loadChaptersFor(manga)
 
-		val chapterElements = catalogDoc.select("li.chapter-li.jsChapter a.chapter-li-a")
+        return manga.copy(
+            description = description,
+            tags = tags,
+            state = state,
+            chapters = chapters,
+        )
+    }
 
-		// 通常目录是“最新在上面”，所以用 reversed = true 让第 1 话排在前面
-		val chapters = chapterElements.mapChapters(true) { index, a ->
-			val chapterHref = a.attrAsRelativeUrl("href")   // /read/145/10590.html
-			val chapterUrl = chapterHref.toAbsoluteUrl(domain)
+    // 解析 /read/{id}/catalog 里的章节列表
+    private suspend fun loadChaptersFor(manga: Manga): List<MangaChapter> {
+        val mangaId = manga.url.substringAfter("/detail/")
+            .substringBefore(".html")
+        val catalogUrl = "https://$domain/read/$mangaId/catalog"
 
-			val titleText = a.selectFirst(".chapter-index")
-				?.text()
-				?.trim()
-				.orEmpty()
+        val doc = webClient.httpGet(catalogUrl).parseHtml()
 
-			MangaChapter(
-				id = generateUid(chapterUrl),
-				title = if (titleText.isNotEmpty()) titleText else "第${index + 1}话",
-				number = index + 1f,
-				volume = 0, // 先不管卷的信息，后面需要再用 vloume-info 做分组
-				url = chapterUrl,
-				scanlator = null,
-				uploadDate = 0,
-				branch = null,
-				source = source,
-			)
-		}
+        val items = doc.select("li.chapter-li.jsChapter a.chapter-li-a")
 
-		return manga.copy(
-			description = description,
-			state = state,
-			chapters = chapters,
-		)
-	}
+        // 网站一般是“最新在上面”，我们这里转成从第一话开始的顺序
+        val raw = items.mapIndexed { index, a ->
+            val href = a.attrAsRelativeUrl("href")            // /read/145/10590.html
+            val url = href.toAbsoluteUrl(domain)
+            val title = a.selectFirst("span.chapter-index")
+                ?.text()
+                ?.trim()
+                .orEmpty()
+                .ifEmpty { "第${index + 1}话" }
 
-	/**
-	 * 阅读页：解析章节图片
-	 * 例：/read/145/10590.html
-	 * 选择器 .chapter-img img 后面你可以根据真实 HTML 再微调
-	 */
-	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
+            MangaChapter(
+                id = generateUid(url),
+                title = title,
+                number = (index + 1).toFloat(),
+                volume = 0,
+                url = url,
+                scanlator = null,
+                uploadDate = 0,
+                branch = null,
+                source = source,
+            )
+        }
 
-		return doc.select(".chapter-img img").mapIndexedNotNull { index, img ->
-			// 注意：img.src() 在这个版本里是 String?，要用 ?. 调用，再判空
-			val src = img.src()
-				?.takeIf { it.isNotBlank() }
-				?.toAbsoluteUrl(domain)
-				?: return@mapIndexedNotNull null
+        return raw.asReversed()   // 反转一下：第1话在前
+    }
 
-			MangaPage(
-				id = generateUid("$src#$index"),
-				url = src,
-				preview = null,
-				source = source,
-			)
-		}
-	}
+    // ================
+    // 3. 章节阅读页 -> 图片列表
+    // https://www.bilimanga.net/read/145/10590.html
+    // img.imagecontent，优先取 data-src，其次 src
+    // ================
+    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+        val doc = webClient.httpGet(chapter.url).parseHtml()
+
+        return doc.select("img.imagecontent").mapIndexedNotNull { index, img ->
+            val raw = img.attr("data-src").takeIf { it.isNotBlank() }
+                ?: img.attr("src")
+
+            if (raw.isNullOrBlank()) {
+                null
+            } else {
+                val url = raw.toAbsoluteUrl(domain)
+                MangaPage(
+                    id = generateUid(url + "#$index"),
+                    url = url,
+                    preview = null,
+                    source = source,
+                )
+            }
+        }
+    }
 }
+
+/**
+ * 小工具：把简单的 HTML 文本里标签干掉
+ *（非常粗暴的版本，够用就行）
+ */
+private fun String.stripHtml(): String =
+    this.replace(Regex("<[^>]+>"), "")
+        .replace("&nbsp;", " ")
+        .trim()
