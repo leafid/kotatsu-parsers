@@ -228,23 +228,27 @@ internal class BiliManga(
      * - 对 bilimanga 本身和图片 CDN 域名的请求，强制加上 Referer/Origin。
      */
     override fun intercept(chain: Interceptor.Chain): Response {
-        val original = chain.request()
-        val url = original.url
-        val host = url.host.lowercase()
+    val original = chain.request()
+    val url = original.url
+    val host = url.host.lowercase()
 
-        // bilimanga 主站 + 图片 CDN 域名都统一加头
-        val needsReferer = host.contains("bilimanga.net") ||
-            host == "i.motiezw.com"
-
-        return if (needsReferer) {
-            val newRequest = original.newBuilder()
-                .header("Referer", "https://$domain/") // 模拟从站内跳转
-                .header("Origin", "https://$domain")
-                .header("User-Agent", UserAgents.CHROME_DESKTOP)
-                .build()
-            chain.proceed(newRequest)
-        } else {
-            chain.proceed(original)
+    // Add headers for Bilimanga site and its CDN domains to bypass Cloudflare
+    val needsHeaders = host.contains("bilimanga.net") ||
+                       host.contains("motiezw.com") || 
+                       host.contains("bilimicro.top") // include known image/CDN hosts
+    return if (needsHeaders) {
+        val newRequest = original.newBuilder()
+            // Simulate browser headers for Cloudflare
+            .header("Referer", "https://${domain}/")  // Pretend origin is Bilimanga site
+            .header("Origin", "https://${domain}")
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 12; Pixel 6 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.130 Mobile Safari/537.36")
+            .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .header("Accept-Language", "zh-CN,zh;q=0.9")
+            .header("Cache-Control", "no-cache")
+            .build()
+        chain.proceed(newRequest)
+    } else {
+        chain.proceed(original)
         }
     }
 }
