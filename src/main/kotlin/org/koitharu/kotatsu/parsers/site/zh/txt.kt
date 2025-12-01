@@ -1,6 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.zh
 
 import okhttp3.Interceptor
+import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -18,16 +19,18 @@ internal class BiliManga(
     context,
     MangaParserSource.BILIMANGA,
     pageSize = 20,
-), Interceptor { // 👈 关键：实现 OkHttp Interceptor
-
-    // 域名
+) {
+    // 域名配置
     override val configKeyDomain = ConfigKey.Domain("www.bilimanga.net")
 
-    // 先只做“人气/点击”这一种排序
+    // 基础URL
+    private val baseUrl get() = "https://$domain"
+
+    // 支持的排序方式
     override val availableSortOrders: Set<SortOrder> =
         EnumSet.of(SortOrder.POPULARITY)
 
-    // 只开启最简单的功能
+    // 过滤能力配置
     override val filterCapabilities: MangaListFilterCapabilities =
         MangaListFilterCapabilities(
             isSearchSupported = false,
@@ -36,30 +39,84 @@ internal class BiliManga(
     override suspend fun getFilterOptions(): MangaListFilterOptions =
         MangaListFilterOptions()
 
-    // ===============
-    // 1. 榜单列表页
-    // /top/weekvisit/{page}.html
-    // ===============
+    // ====================
+    // 核心：配置全局请求拦截器（添加必要的请求头）
+    // ====================
+    init {
+        // 注册全局拦截器，为所有请求添加必要的头信息
+        webClient.addInterceptor(HeadersInterceptor())
+    }
+
+    /**
+     * 请求头拦截器：
+     * - 为所有请求添加必要的Referer、Origin、User-Agent等头
+     * - 确保图片CDN能正常返回图片，不会被拦截
+     */
+    private inner class HeadersInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val originalRequest = chain.request()
+            val url = originalRequest.url
+            val host = url.host.lowercase()
+
+            // 需要添加Referer的域名列表（主站 + 图片CDN）
+            val needProtectedHeaders = host.contains("bilimanga") ||
+                host.contains("motiezw") ||
+                host.contains("bilicdn") ||
+                host.contains("biliapi")
+
+            val newRequestBuilder: Request.Builder = originalRequest.newBuilder()
+                // 基础浏览器UA，避免被识别为爬虫
+                .header("User-Agent", context.defaultUserAgent)
+                // 接受的内容类型
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("Accept-Encoding", "gzip, deflate, br")
+                // 保持连接
+                .header("Connection", "keep-alive")
+                // 不缓存
+                .header("Cache-Control", "no-cache")
+
+            // 为受保护的域名添加Referer和Origin
+            if (needProtectedHeaders) {
+                newRequestBuilder
+                    .header("Referer", baseUrl + "/")
+                    .header("Origin", baseUrl)
+                    // 添加X-Requested-With，模拟AJAX请求
+                    .header("X-Requested-With", "XMLHttpRequest")
+            }
+
+            // 构建新请求并执行
+            val newRequest = newRequestBuilder.build()
+            return chain.proceed(newRequest)
+        }
+    }
+
+    // ====================
+    // 1. 榜单列表页解析
+    // ====================
     override suspend fun getListPage(
         page: Int,
         order: SortOrder,
         filter: MangaListFilter,
     ): List<Manga> {
-        val url = "https://$domain/top/weekvisit/$page.html"
+        val url = "$baseUrl/top/weekvisit/$page.html"
         val doc = webClient.httpGet(url).parseHtml()
         return parseRankingList(doc)
     }
 
     private fun parseRankingList(doc: Document): List<Manga> {
         return doc.select("ol#list_content li.book-li a.book-layout").map { a ->
-            val href = a.attrAsRelativeUrl("href")          // /detail/145.html
+            val href = a.attrAsRelativeUrl("href")
             val mangaUrl = href.toAbsoluteUrl(domain)
 
             val title = a.selectFirst(".book-title")?.text().orEmpty()
-            val coverUrl = a.selectFirst("img")?.src().orEmpty()
-            val author = a.selectFirst(".book-author")?.text()
-                ?.trim()
-                .orEmpty()
+            val coverUrl = a.selectFirst("img")?.let { img ->
+                // 优先取data-src，其次src，并补全绝对URL
+                (img.attr("data-src").takeIf { it.isNotBlank() } ?: img.attr("src"))
+                    .toAbsoluteUrl(domain)
+            }.orEmpty()
+
+            val author = a.selectFirst(".book-author")?.text()?.trim().orEmpty()
 
             Manga(
                 id = generateUid(mangaUrl),
@@ -74,77 +131,73 @@ internal class BiliManga(
                 state = null,
                 source = source,
                 contentRating = null,
+                description = "",
+                chapters = emptyList()
             )
         }
     }
 
-    // ================
-    // 2. 详情页
-    // https://www.bilimanga.net/detail/145.html
-    // 解析简介 + 标签 + 状态，并顺便解析章节（通过 /read/{id}/catalog）
-    // ================
+    // ====================
+    // 2. 漫画详情页解析
+    // ====================
     override suspend fun getDetails(manga: Manga): Manga {
         val doc = webClient.httpGet(manga.url).parseHtml()
 
-        // 简介：<content> ... </content>
+        // 解析简介
         val description = doc.selectFirst("content")
-            ?.html()   // 保留 <br>
-            ?.replace("<br>", "\n")
-            ?.replace("<br/>", "\n")
-            ?.replace("<br />", "\n")
+            ?.html()
+            ?.replace(Regex("<br\\s*/?>"), "\n") // 匹配所有br标签
             ?.stripHtml()
             .orEmpty()
 
-        // 标签：span.tag-small-group em.tag-small a
-        val tagElements = doc.select("span.tag-small-group em.tag-small a")
-        val tags: Set<MangaTag> = tagElements.map { a ->
-            val name = a.text().trim()
-            MangaTag(
-                key = name,      // 直接用文字当 key 即可
-                title = name,
-                source = source,
-            )
-        }.toSet()
+        // 解析标签
+        val tags: Set<MangaTag> = doc.select("span.tag-small-group em.tag-small a")
+            .map { a ->
+                val name = a.text().trim()
+                MangaTag(
+                    key = name,
+                    title = name,
+                    source = source,
+                )
+            }.toSet()
 
-        // 连载状态（页面上如果有的话就解析一下）
-        val state = doc.selectFirst(".status-tag")?.text()?.let {
+        // 解析连载状态
+        val state = doc.selectFirst(".status-tag")?.text()?.let { statusText ->
             when {
-                it.contains("连载") || it.contains("連載") -> MangaState.ONGOING
-                it.contains("完结") || it.contains("完結") -> MangaState.FINISHED
+                statusText.contains("连载", ignoreCase = true) -> MangaState.ONGOING
+                statusText.contains("完结", ignoreCase = true) -> MangaState.FINISHED
                 else -> null
             }
         }
 
-        // 章节：转到 /read/{id}/catalog
+        // 加载章节列表
         val chapters = loadChaptersFor(manga)
 
         return manga.copy(
             description = description,
             tags = tags,
             state = state,
-            chapters = chapters,
+            chapters = chapters
         )
     }
 
-    // 解析 /read/{id}/catalog 里的章节列表
+    // ====================
+    // 3. 章节列表加载
+    // ====================
     private suspend fun loadChaptersFor(manga: Manga): List<MangaChapter> {
-        val mangaId = manga.url.substringAfter("/detail/")
-            .substringBefore(".html")
-        val catalogUrl = "https://$domain/read/$mangaId/catalog"
+        val mangaId = manga.url.substringAfter("/detail/").substringBefore(".html")
+        val catalogUrl = "$baseUrl/read/$mangaId/catalog"
 
         val doc = webClient.httpGet(catalogUrl).parseHtml()
-
         val items = doc.select("li.chapter-li.jsChapter a.chapter-li-a")
 
-        // 网站一般是“最新在上面”，我们这里转成从第一话开始的顺序
-        val raw = items.mapIndexed { index, a ->
-            val href = a.attrAsRelativeUrl("href")            // /read/145/10590.html
+        // 反转章节顺序（最新的在最后）
+        return items.reversed().mapIndexed { index, a ->
+            val href = a.attrAsRelativeUrl("href")
             val url = href.toAbsoluteUrl(domain)
-            val title = a.selectFirst("span.chapter-index")
-                ?.text()
-                ?.trim()
-                .orEmpty()
-                .ifEmpty { "第${index + 1}话" }
+
+            val chapterIndex = a.selectFirst("span.chapter-index")?.text()?.trim()
+            val title = chapterIndex.takeIf { it.isNullOrBlank().not() } ?: "第${index + 1}话"
 
             MangaChapter(
                 id = generateUid(url),
@@ -155,75 +208,50 @@ internal class BiliManga(
                 scanlator = null,
                 uploadDate = 0,
                 branch = null,
-                source = source,
+                source = source
             )
         }
-
-        return raw.asReversed()   // 反转一下：第1话在前
     }
 
-    // ================
-    // 3. 章节阅读页 -> 图片列表
-    // https://www.bilimanga.net/read/145/10590.html
-    // img.imagecontent，优先取 data-src，其次 src
-    // ================
+    // ====================
+    // 4. 章节图片解析
+    // ====================
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val doc = webClient.httpGet(chapter.url).parseHtml()
 
         return doc.select("div#acontentz img.imagecontent").mapIndexedNotNull { index, img ->
-            // 1. 先拿真正的图片地址（data-src）
-            val candidate = img.attr("data-src").takeIf { it.isNotBlank() }
+            // 优先获取data-src，其次src
+            val imageUrl = img.attr("data-src").takeIf { it.isNotBlank() }
                 ?: img.attr("src")
 
-            // 2. 过滤掉占位图 / 空串
-            if (candidate.isNullOrBlank() || candidate.startsWith("/images/sloading")) {
+            // 过滤占位图和空URL
+            if (imageUrl.isBlank() ||
+                imageUrl.contains("sloading", ignoreCase = true) ||
+                imageUrl.contains("placeholder", ignoreCase = true)) {
                 return@mapIndexedNotNull null
             }
 
-            // 3. 处理相对 / 绝对 URL
-            val url = candidate.toAbsoluteUrl(domain)
+            // 补全绝对URL
+            val fullImageUrl = imageUrl.toAbsoluteUrl(domain)
 
             MangaPage(
-                id = generateUid(url + "#$index"),
-                url = url,
+                id = generateUid("$fullImageUrl#$index"),
+                url = fullImageUrl,
                 preview = null,
-                source = source,
+                source = source
             )
         }
     }
 
     /**
-     * 关键拦截器：
-     *
-     * - 对 bilimanga 本身和图片 CDN 域名的请求，强制加上 Referer/Origin。
-     * - 这样图片服务器会认为请求是从 bilimanga 网页发出的，不会再返回 "Sorry, you have been blocked"。
+     * 增强版HTML清理工具
      */
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val original = chain.request()
-        val url = original.url
-        val host = url.host.lowercase()
-
-        // bilimanga 主站 + 图片 CDN 域名都统一加头
-        val needsReferer = host.contains("bilimanga.net") ||
-            host == "i.motiezw.com"
-
-        return if (needsReferer) {
-            val newRequest = original.newBuilder()
-                .header("Referer", "https://$domain/") // 模拟从站内跳转
-                .header("Origin", "https://$domain")
-                .build()
-            chain.proceed(newRequest)
-        } else {
-            chain.proceed(original)
-        }
-    }
-}
-
-/**
- * 小工具：把简单的 HTML 文本里标签干掉
- *（非常粗暴的版本，够用就行）
- */
-private fun String.stripHtml(): String =
-    this.replace(Regex("<[^>]+>"), "")
-        .replace("&nbsp;", " ")
+    private fun String.stripHtml(): String = this
+        .replace(Regex("<[^>]+>"), "") // 移除所有HTML标签
+        .replace("&nbsp;", " ")       // 替换空格实体
+        .replace("&amp;", "&")        // 替换&实体
+        .replace("&lt;", "<")         // 替换<实体
+        .replace("&gt;", ">")         // 替换>实体
+        .replace(Regex("\\s+"), " ")  // 合并多个空格
         .trim()
+}
