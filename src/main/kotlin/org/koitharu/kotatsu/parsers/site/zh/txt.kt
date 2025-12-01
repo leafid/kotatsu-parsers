@@ -20,6 +20,7 @@ internal class BiliManga(
     MangaParserSource.BILIMANGA,
     pageSize = 20,
 ) {
+
     // 域名配置
     override val configKeyDomain = ConfigKey.Domain("www.bilimanga.net")
 
@@ -40,55 +41,40 @@ internal class BiliManga(
         MangaListFilterOptions()
 
     // ====================
-    // 核心：配置全局请求拦截器（添加必要的请求头）
+    // 关键修改：重写 intercept，而不是 webClient.addInterceptor(...)
     // ====================
-    init {
-        // 注册全局拦截器，为所有请求添加必要的头信息
-        webClient.addInterceptor(HeadersInterceptor())
-    }
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val originalRequest = chain.request()
+        val url = originalRequest.url
+        val host = url.host.lowercase()
 
-    /**
-     * 请求头拦截器：
-     * - 为所有请求添加必要的Referer、Origin、User-Agent等头
-     * - 确保图片CDN能正常返回图片，不会被拦截
-     */
-    private inner class HeadersInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val originalRequest = chain.request()
-            val url = originalRequest.url
-            val host = url.host.lowercase()
+        // 需要添加 Referer 的域名列表（主站 + 图片 CDN）
+        val needProtectedHeaders = host.contains("bilimanga") ||
+            host.contains("motiezw") ||
+            host.contains("bilicdn") ||
+            host.contains("biliapi")
 
-            // 需要添加Referer的域名列表（主站 + 图片CDN）
-            val needProtectedHeaders = host.contains("bilimanga") ||
-                host.contains("motiezw") ||
-                host.contains("bilicdn") ||
-                host.contains("biliapi")
+        val newRequestBuilder: Request.Builder = originalRequest.newBuilder()
+            // 使用 context.getDefaultUserAgent()，而不是 context.defaultUserAgent
+            .header("User-Agent", context.getDefaultUserAgent())
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+            )
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Connection", "keep-alive")
+            .header("Cache-Control", "no-cache")
 
-            val newRequestBuilder: Request.Builder = originalRequest.newBuilder()
-                // 基础浏览器UA，避免被识别为爬虫
-                .header("User-Agent", context.defaultUserAgent)
-                // 接受的内容类型
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-                .header("Accept-Encoding", "gzip, deflate, br")
-                // 保持连接
-                .header("Connection", "keep-alive")
-                // 不缓存
-                .header("Cache-Control", "no-cache")
-
-            // 为受保护的域名添加Referer和Origin
-            if (needProtectedHeaders) {
-                newRequestBuilder
-                    .header("Referer", baseUrl + "/")
-                    .header("Origin", baseUrl)
-                    // 添加X-Requested-With，模拟AJAX请求
-                    .header("X-Requested-With", "XMLHttpRequest")
-            }
-
-            // 构建新请求并执行
-            val newRequest = newRequestBuilder.build()
-            return chain.proceed(newRequest)
+        if (needProtectedHeaders) {
+            newRequestBuilder
+                .header("Referer", "$baseUrl/")
+                .header("Origin", baseUrl)
+                .header("X-Requested-With", "XMLHttpRequest")
         }
+
+        val newRequest = newRequestBuilder.build()
+        return chain.proceed(newRequest)
     }
 
     // ====================
@@ -111,7 +97,6 @@ internal class BiliManga(
 
             val title = a.selectFirst(".book-title")?.text().orEmpty()
             val coverUrl = a.selectFirst("img")?.let { img ->
-                // 优先取data-src，其次src，并补全绝对URL
                 (img.attr("data-src").takeIf { it.isNotBlank() } ?: img.attr("src"))
                     .toAbsoluteUrl(domain)
             }.orEmpty()
@@ -143,14 +128,12 @@ internal class BiliManga(
     override suspend fun getDetails(manga: Manga): Manga {
         val doc = webClient.httpGet(manga.url).parseHtml()
 
-        // 解析简介
         val description = doc.selectFirst("content")
             ?.html()
-            ?.replace(Regex("<br\\s*/?>"), "\n") // 匹配所有br标签
+            ?.replace(Regex("<br\\s*/?>"), "\n")
             ?.stripHtml()
             .orEmpty()
 
-        // 解析标签
         val tags: Set<MangaTag> = doc.select("span.tag-small-group em.tag-small a")
             .map { a ->
                 val name = a.text().trim()
@@ -161,7 +144,6 @@ internal class BiliManga(
                 )
             }.toSet()
 
-        // 解析连载状态
         val state = doc.selectFirst(".status-tag")?.text()?.let { statusText ->
             when {
                 statusText.contains("连载", ignoreCase = true) -> MangaState.ONGOING
@@ -170,7 +152,6 @@ internal class BiliManga(
             }
         }
 
-        // 加载章节列表
         val chapters = loadChaptersFor(manga)
 
         return manga.copy(
@@ -191,13 +172,12 @@ internal class BiliManga(
         val doc = webClient.httpGet(catalogUrl).parseHtml()
         val items = doc.select("li.chapter-li.jsChapter a.chapter-li-a")
 
-        // 反转章节顺序（最新的在最后）
         return items.reversed().mapIndexed { index, a ->
             val href = a.attrAsRelativeUrl("href")
             val url = href.toAbsoluteUrl(domain)
 
             val chapterIndex = a.selectFirst("span.chapter-index")?.text()?.trim()
-            val title = chapterIndex.takeIf { it.isNullOrBlank().not() } ?: "第${index + 1}话"
+            val title = chapterIndex.takeIf { !it.isNullOrBlank() } ?: "第${index + 1}话"
 
             MangaChapter(
                 id = generateUid(url),
@@ -220,18 +200,16 @@ internal class BiliManga(
         val doc = webClient.httpGet(chapter.url).parseHtml()
 
         return doc.select("div#acontentz img.imagecontent").mapIndexedNotNull { index, img ->
-            // 优先获取data-src，其次src
             val imageUrl = img.attr("data-src").takeIf { it.isNotBlank() }
                 ?: img.attr("src")
 
-            // 过滤占位图和空URL
             if (imageUrl.isBlank() ||
                 imageUrl.contains("sloading", ignoreCase = true) ||
-                imageUrl.contains("placeholder", ignoreCase = true)) {
+                imageUrl.contains("placeholder", ignoreCase = true)
+            ) {
                 return@mapIndexedNotNull null
             }
 
-            // 补全绝对URL
             val fullImageUrl = imageUrl.toAbsoluteUrl(domain)
 
             MangaPage(
@@ -243,15 +221,12 @@ internal class BiliManga(
         }
     }
 
-    /**
-     * 增强版HTML清理工具
-     */
     private fun String.stripHtml(): String = this
-        .replace(Regex("<[^>]+>"), "") // 移除所有HTML标签
-        .replace("&nbsp;", " ")       // 替换空格实体
-        .replace("&amp;", "&")        // 替换&实体
-        .replace("&lt;", "<")         // 替换<实体
-        .replace("&gt;", ">")         // 替换>实体
-        .replace(Regex("\\s+"), " ")  // 合并多个空格
+        .replace(Regex("<[^>]+>"), "")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace(Regex("\\s+"), " ")
         .trim()
 }
